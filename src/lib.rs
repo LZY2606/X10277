@@ -1183,6 +1183,256 @@ impl<F: fmt::Debug> fmt::Debug for CompoundFile<F> {
     }
 }
 
+impl<F> CompoundFile<F> {
+    /// **Unstable test-support API; not covered by semver.**
+    ///
+    /// Renders a deterministic textual summary of this compound file's
+    /// structure: the FAT/MiniFAT allocation chains of every stream and of
+    /// the directory, MiniFAT, and mini stream, plus the directory
+    /// parent/child relations.  Sector, mini-sector, and stream IDs are
+    /// renumbered in order of first appearance, so two files that differ
+    /// only in internal numbering (e.g. because entries were created in a
+    /// different order, or the file was compacted) produce the same
+    /// summary.
+    ///
+    /// This reads the very same in-memory FAT, MiniFAT, and directory
+    /// state that the production read/write paths maintain (there is no
+    /// separate shadow copy and no re-parsing of the underlying file),
+    /// which is what makes it useful as a compatibility gate for the
+    /// fixture generator in `tests/fixture_gate.rs`.  It is
+    /// `#[doc(hidden)]` and may change or be removed in any release; it is
+    /// not used by, and does not alter, any public entry point.
+    #[doc(hidden)]
+    pub fn structural_summary(&self) -> String {
+        let minialloc = self.minialloc();
+        let directory = minialloc.directory();
+        let allocator = directory.allocator();
+        let fat = allocator.fat();
+        let minifat = minialloc.minifat();
+        let dir_entries = directory.dir_entries();
+
+        let mut labeler = SummaryLabeler::default();
+        let mut out = String::new();
+
+        // Allocation overview.  Chains are walked over the in-memory FAT
+        // and labelled in a fixed order (directory, DIFAT, MiniFAT, mini
+        // stream) so that the labels are stable.
+        out.push_str(&format!(
+            "cfb version={:?} sector_len={}\n",
+            minialloc.version(),
+            minialloc.sector_len(),
+        ));
+        let fat_sectors =
+            fat.iter().filter(|&&e| e == consts::FAT_SECTOR).count();
+        let difat_sectors =
+            fat.iter().filter(|&&e| e == consts::DIFAT_SECTOR).count();
+        let free_sectors =
+            fat.iter().filter(|&&e| e == consts::FREE_SECTOR).count();
+        out.push_str(&format!(
+            "fat entries={} fat_sectors={} difat_sectors={} free={}\n",
+            fat.len(),
+            fat_sectors,
+            difat_sectors,
+            free_sectors,
+        ));
+        out.push_str(&format!(
+            "dir_chain={}\n",
+            labeler
+                .label_chain(directory.dir_sector_ids().iter().copied())
+        ));
+        out.push_str(&format!(
+            "difat_chain={}\n",
+            labeler.label_chain(allocator.difat_sector_ids().iter().copied())
+        ));
+        out.push_str(&format!(
+            "minifat_chain={} entries={} free={}\n",
+            labeler
+                .label_chain(walk_chain(fat, minialloc.minifat_start_sector())),
+            minifat.len(),
+            minifat.iter().filter(|&&e| e == consts::FREE_SECTOR).count(),
+        ));
+        let root = minialloc.root_dir_entry();
+        out.push_str(&format!(
+            "mini_stream_chain={} len={}\n",
+            labeler.label_chain(walk_chain(fat, root.start_sector)),
+            root.stream_len,
+        ));
+
+        // Directory relations and per-stream allocation chains, in a
+        // canonical preorder traversal (children in sorted name order), so
+        // that the red-black tree shape and stream-ID assignment do not
+        // leak into the summary.
+        out.push_str("entries:\n");
+        let mut next_entry_label = 0usize;
+        summarize_entry(
+            &mut out,
+            &mut labeler,
+            fat,
+            minifat,
+            dir_entries,
+            consts::ROOT_STREAM_ID,
+            None,
+            &mut next_entry_label,
+        );
+        out
+    }
+}
+
+/// Assigns normalized labels (`S0`, `S1`, ... for regular sectors, `m0`,
+/// `m1`, ... for mini sectors) in order of first appearance, so that a
+/// structural summary does not depend on internal numbering.
+#[derive(Default)]
+struct SummaryLabeler {
+    sector_labels: std::collections::HashMap<u32, usize>,
+    mini_labels: std::collections::HashMap<u32, usize>,
+}
+
+impl SummaryLabeler {
+    fn sector(&mut self, sector_id: u32) -> String {
+        let next = self.sector_labels.len();
+        let label = self.sector_labels.entry(sector_id).or_insert(next);
+        format!("S{}", *label)
+    }
+
+    fn mini(&mut self, mini_sector_id: u32) -> String {
+        let next = self.mini_labels.len();
+        let label = self.mini_labels.entry(mini_sector_id).or_insert(next);
+        format!("m{}", *label)
+    }
+
+    fn label_chain(
+        &mut self,
+        chain: impl IntoIterator<Item = u32>,
+    ) -> String {
+        let labels: Vec<String> =
+            chain.into_iter().map(|id| self.sector(id)).collect();
+        format!("[{}]", labels.join(","))
+    }
+}
+
+/// Walks a FAT chain over the in-memory FAT, stopping at the end of the
+/// chain (or defensively, at any malformed or repeated entry).
+fn walk_chain(fat: &[u32], start_sector_id: u32) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut current = start_sector_id;
+    while current != consts::END_OF_CHAIN && (current as usize) < fat.len()
+        && !chain.contains(&current)
+    {
+        chain.push(current);
+        current = fat[current as usize];
+    }
+    chain
+}
+
+/// Appends one line per directory entry to `out`, in a canonical preorder
+/// traversal: each storage is followed by its children in sorted name
+/// order (an in-order walk of its sibling tree).
+fn summarize_entry(
+    out: &mut String,
+    labeler: &mut SummaryLabeler,
+    fat: &[u32],
+    minifat: &[u32],
+    dir_entries: &[DirEntry],
+    stream_id: u32,
+    parent_label: Option<usize>,
+    next_entry_label: &mut usize,
+) {
+    let entry = &dir_entries[stream_id as usize];
+    let label = *next_entry_label;
+    *next_entry_label += 1;
+    let parent = match parent_label {
+        Some(parent) => format!("e{}", parent),
+        None => "-".to_string(),
+    };
+    let obj_type = match entry.obj_type {
+        ObjType::Root => "root",
+        ObjType::Storage => "storage",
+        ObjType::Stream => "stream",
+        ObjType::Unallocated => "unallocated",
+    };
+    let allocation = if entry.obj_type == ObjType::Stream {
+        if entry.stream_len < consts::MINI_STREAM_CUTOFF as u64 {
+            let chain: Vec<String> = walk_chain(minifat, entry.start_sector)
+                .into_iter()
+                .map(|id| labeler.mini(id))
+                .collect();
+            format!(" minichain=[{}]", chain.join(","))
+        } else {
+            format!(
+                " chain={}",
+                labeler.label_chain(walk_chain(fat, entry.start_sector))
+            )
+        }
+    } else {
+        String::new()
+    };
+    out.push_str(&format!(
+        "e{} parent={} type={} name={:?} len={}{}\n",
+        label, parent, obj_type, entry.name, entry.stream_len, allocation,
+    ));
+    // Visit children in sorted name order: an in-order traversal of the
+    // sibling tree rooted at this entry's child pointer.
+    if entry.obj_type == ObjType::Storage || entry.obj_type == ObjType::Root
+    {
+        summarize_siblings(
+            out,
+            labeler,
+            fat,
+            minifat,
+            dir_entries,
+            entry.child,
+            label,
+            next_entry_label,
+        );
+    }
+}
+
+fn summarize_siblings(
+    out: &mut String,
+    labeler: &mut SummaryLabeler,
+    fat: &[u32],
+    minifat: &[u32],
+    dir_entries: &[DirEntry],
+    sibling_id: u32,
+    parent_label: usize,
+    next_entry_label: &mut usize,
+) {
+    if sibling_id == consts::NO_STREAM {
+        return;
+    }
+    let entry = &dir_entries[sibling_id as usize];
+    summarize_siblings(
+        out,
+        labeler,
+        fat,
+        minifat,
+        dir_entries,
+        entry.left_sibling,
+        parent_label,
+        next_entry_label,
+    );
+    summarize_entry(
+        out,
+        labeler,
+        fat,
+        minifat,
+        dir_entries,
+        sibling_id,
+        Some(parent_label),
+        next_entry_label,
+    );
+    summarize_siblings(
+        out,
+        labeler,
+        fat,
+        minifat,
+        dir_entries,
+        entry.right_sibling,
+        parent_label,
+        next_entry_label,
+    );
+}
+
 trait ReadLeNumber: Read {
     fn read_le_u64(&mut self) -> Result<u64, std::io::Error> {
         let mut buf = [0u8; 8];

@@ -25,13 +25,19 @@ pub struct Allocator<F> {
     difat: Vec<u32>,
     fat: Vec<u32>,
     free_sectors: Vec<u32>,
+    /// Identity of the current FAT contents, bumped on every `set_fat`.
+    /// The chain cache below is only valid for the FAT version it was
+    /// recorded under, so a stale cache left over from before a mutation
+    /// (including a mutation that failed partway) can never be handed out.
+    fat_version: u64,
     /// The sector IDs of the most recently used chain, keyed by its start
-    /// sector.  A `Stream` opens its chain anew for every buffer refill,
-    /// and walking a long FAT chain from the start each time made reading
-    /// or writing a stream of `n` sectors cost `O(n^2)`.  The list is
-    /// handed to the next `Chain` opened for the same start sector, which
-    /// gives it back when dropped; any FAT change discards it.
-    chain_cache: Option<(u32, Vec<u32>)>,
+    /// sector and the FAT version it was walked under.  A `Stream` opens
+    /// its chain anew for every buffer refill, and walking a long FAT chain
+    /// from the start each time made reading or writing a stream of `n`
+    /// sectors cost `O(n^2)`.  The list is handed to the next `Chain`
+    /// opened for the same start sector, which gives it back when dropped;
+    /// any FAT change bumps `fat_version` and so invalidates it.
+    chain_cache: Option<(u32, u64, Vec<u32>)>,
 }
 
 impl<F> Allocator<F> {
@@ -48,6 +54,7 @@ impl<F> Allocator<F> {
             difat,
             fat,
             free_sectors: Vec::new(),
+            fat_version: 0,
             chain_cache: None,
         };
         alloc.validate(validation)?;
@@ -89,14 +96,26 @@ impl<F> Allocator<F> {
         self.sectors.into_inner()
     }
 
+    /// The FAT entries, as currently held in memory (and mirrored to the
+    /// underlying file).  Used by the structural summary.
+    pub(crate) fn fat(&self) -> &[u32] {
+        &self.fat
+    }
+
+    /// The sector IDs of the DIFAT sectors, in chain order.
+    pub(crate) fn difat_sector_ids(&self) -> &[u32] {
+        &self.difat_sector_ids
+    }
+
     pub fn open_chain(
         &mut self,
         start_sector_id: u32,
         init: SectorInit,
     ) -> io::Result<Chain<'_, F>> {
         match self.chain_cache.take() {
-            Some((cached_start, sector_ids))
-                if cached_start == start_sector_id =>
+            Some((cached_start, cached_version, sector_ids))
+                if cached_start == start_sector_id
+                    && cached_version == self.fat_version =>
             {
                 Ok(Chain::from_sector_ids(self, sector_ids, init))
             }
@@ -106,14 +125,16 @@ impl<F> Allocator<F> {
 
     /// Remembers the sector IDs of the chain starting at `start_sector_id`
     /// so that the next `open_chain` for it need not walk the FAT again.
-    /// The IDs must reflect the current FAT.
+    /// The IDs must reflect the current FAT; they are tagged with the
+    /// current FAT version so that a later FAT change invalidates them.
     pub(crate) fn cache_chain(
         &mut self,
         start_sector_id: u32,
         sector_ids: Vec<u32>,
     ) {
         debug_assert_eq!(sector_ids.first(), Some(&start_sector_id));
-        self.chain_cache = Some((start_sector_id, sector_ids));
+        self.chain_cache =
+            Some((start_sector_id, self.fat_version, sector_ids));
     }
 
     fn validate(&mut self, validation: Validation) -> io::Result<()> {
@@ -510,7 +531,7 @@ impl<F: Write + Seek> Allocator<F> {
     /// Sets `self.fat[index] = value`, and also writes that change to the
     /// underlying file.  The `index` must be <= `self.fat.len()`.
     fn set_fat(&mut self, index: u32, value: u32) -> io::Result<()> {
-        self.chain_cache = None;
+        self.fat_version = self.fat_version.wrapping_add(1);
         let index = index as usize;
         debug_assert!(index <= self.fat.len());
         let fat_entries_per_sector =
@@ -702,14 +723,20 @@ mod tests {
         let chain = alloc.open_chain(1, SectorInit::Zero).unwrap();
         assert_eq!(chain.sector_ids(), &[1, 2, 3]);
         drop(chain);
-        assert_eq!(alloc.chain_cache, Some((1, vec![1, 2, 3])));
+        assert_eq!(
+            alloc.chain_cache,
+            Some((1, alloc.fat_version, vec![1, 2, 3]))
+        );
 
         // A chain that grew hands back the grown list.
         let mut chain = alloc.open_chain(1, SectorInit::Zero).unwrap();
         chain.set_len(4 * 512).unwrap();
         assert_eq!(chain.sector_ids(), &[1, 2, 3, 4]);
         drop(chain);
-        assert_eq!(alloc.chain_cache, Some((1, vec![1, 2, 3, 4])));
+        assert_eq!(
+            alloc.chain_cache,
+            Some((1, alloc.fat_version, vec![1, 2, 3, 4]))
+        );
         let chain = Chain::new(&mut alloc, 1, SectorInit::Zero).unwrap();
         assert_eq!(chain.sector_ids(), &[1, 2, 3, 4]);
         drop(chain);
@@ -719,7 +746,10 @@ mod tests {
         chain.set_len(2 * 512).unwrap();
         assert_eq!(chain.sector_ids(), &[1, 2]);
         drop(chain);
-        assert_eq!(alloc.chain_cache, Some((1, vec![1, 2])));
+        assert_eq!(
+            alloc.chain_cache,
+            Some((1, alloc.fat_version, vec![1, 2]))
+        );
         let chain = Chain::new(&mut alloc, 1, SectorInit::Zero).unwrap();
         assert_eq!(chain.sector_ids(), &[1, 2]);
         drop(chain);
@@ -729,17 +759,54 @@ mod tests {
         let chain = alloc.open_chain(start, SectorInit::Zero).unwrap();
         assert_eq!(chain.sector_ids(), &[start]);
         drop(chain);
-        assert_eq!(alloc.chain_cache, Some((start, vec![start])));
+        assert_eq!(
+            alloc.chain_cache,
+            Some((start, alloc.fat_version, vec![start]))
+        );
 
-        // Any FAT change from outside a chain discards the cache.
+        // Any FAT change from outside a chain invalidates the cache: the
+        // cached list keeps its old FAT version and stops matching.
+        let cached_version =
+            alloc.chain_cache.as_ref().map(|&(_, version, _)| version);
         alloc.free_chain(1).unwrap();
-        assert_eq!(alloc.chain_cache, None);
+        assert_ne!(cached_version, Some(alloc.fat_version));
 
         // A freed chain leaves nothing behind.
         let chain = alloc.open_chain(start, SectorInit::Zero).unwrap();
         chain.free().unwrap();
         assert_eq!(alloc.chain_cache, None);
         assert_eq!(alloc.fat[start as usize], consts::FREE_SECTOR);
+    }
+
+    #[test]
+    fn stale_chain_cache_is_not_handed_out() {
+        let difat = vec![0];
+        let fat = vec![consts::FAT_SECTOR, 2, 3, consts::END_OF_CHAIN];
+        let mut alloc = make_allocator(difat, fat, Validation::Strict);
+        let chain = alloc.open_chain(1, SectorInit::Zero).unwrap();
+        assert_eq!(chain.sector_ids(), &[1, 2, 3]);
+        drop(chain);
+        assert_eq!(
+            alloc.chain_cache,
+            Some((1, alloc.fat_version, vec![1, 2, 3]))
+        );
+
+        // Shorten the chain without going through a Chain handle.  The
+        // cached list is now stale, and its version tag no longer matches.
+        alloc.free_chain_after(2).unwrap();
+        assert_ne!(
+            alloc.chain_cache.as_ref().map(|&(_, version, _)| version),
+            Some(alloc.fat_version)
+        );
+
+        // Reopening must reflect the current FAT, not the stale cache.
+        let chain = alloc.open_chain(1, SectorInit::Zero).unwrap();
+        assert_eq!(chain.sector_ids(), &[1, 2]);
+        drop(chain);
+        assert_eq!(
+            alloc.chain_cache,
+            Some((1, alloc.fat_version, vec![1, 2]))
+        );
     }
 
     #[test]

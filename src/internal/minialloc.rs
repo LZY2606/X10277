@@ -27,16 +27,22 @@ pub struct MiniAllocator<F> {
     minifat: Vec<u32>,
     minifat_start_sector: u32,
     free_mini_sectors: Vec<u32>,
+    /// Identity of the current mini-stream/MiniFAT chain topology, bumped
+    /// whenever a regular chain is freed.  The two caches below are only
+    /// valid for the version they were walked under, so a stale cache left
+    /// over from before a mutation (including one that failed partway) can
+    /// never be handed out.
+    chain_cache_version: u64,
     /// The sector IDs of the mini stream's chain, in order, once walked.
     /// Every access to a mini sector needs the regular sector it lives in;
     /// walking the FAT chain from the start on each access made reading or
     /// writing `n` small streams cost `O(n²)`. The chain only ever grows
     /// (see `append_mini_sector`), so it is walked once and extended in
-    /// place.
-    mini_stream_sectors: Option<Vec<u32>>,
+    /// place.  Tagged with `chain_cache_version`.
+    mini_stream_sectors: Option<(u64, Vec<u32>)>,
     /// The sector IDs of the MiniFAT's chain, kept the same way for
-    /// `set_minifat`.
-    minifat_sectors: Option<Vec<u32>>,
+    /// `set_minifat`.  Tagged with `chain_cache_version`.
+    minifat_sectors: Option<(u64, Vec<u32>)>,
 }
 
 impl<F> MiniAllocator<F> {
@@ -51,6 +57,7 @@ impl<F> MiniAllocator<F> {
             minifat,
             minifat_start_sector,
             free_mini_sectors: Vec::new(),
+            chain_cache_version: 0,
             mini_stream_sectors: None,
             minifat_sectors: None,
         };
@@ -64,6 +71,24 @@ impl<F> MiniAllocator<F> {
 
     pub fn inner(&self) -> &F {
         self.directory.inner()
+    }
+
+    /// The directory manager that this allocator wraps.  Used by the
+    /// structural summary.
+    pub(crate) fn directory(&self) -> &Directory<F> {
+        &self.directory
+    }
+
+    /// The MiniFAT entries, as currently held in memory (and mirrored to
+    /// the underlying file).  Used by the structural summary.
+    pub(crate) fn minifat(&self) -> &[u32] {
+        &self.minifat
+    }
+
+    /// The start sector of the MiniFAT chain.  Used by the structural
+    /// summary.
+    pub(crate) fn minifat_start_sector(&self) -> u32 {
+        self.minifat_start_sector
     }
 
     pub fn next_mini_sector(&self, sector_id: u32) -> io::Result<u32> {
@@ -173,13 +198,20 @@ impl<F> MiniAllocator<F> {
 
 impl<F: Seek> MiniAllocator<F> {
     /// Returns the sector IDs of the chain starting at `start_sector_id`,
-    /// walking it once and caching the result in `cache`.
+    /// walking it once and caching the result in `cache`, tagged with
+    /// `version`.  A cache entry recorded under any other version is
+    /// stale and is walked again.
     fn cached_chain_sectors<'a>(
         directory: &mut Directory<F>,
-        cache: &'a mut Option<Vec<u32>>,
+        cache: &'a mut Option<(u64, Vec<u32>)>,
+        version: u64,
         start_sector_id: u32,
     ) -> io::Result<&'a [u32]> {
-        if cache.is_none() {
+        let stale = match cache {
+            None => true,
+            Some((cached_version, _)) => *cached_version != version,
+        };
+        if stale {
             let sector_ids = if start_sector_id == consts::END_OF_CHAIN {
                 Vec::new()
             } else {
@@ -188,17 +220,19 @@ impl<F: Seek> MiniAllocator<F> {
                     .sector_ids()
                     .to_vec()
             };
-            *cache = Some(sector_ids);
+            *cache = Some((version, sector_ids));
         }
-        Ok(cache.as_deref().unwrap())
+        Ok(&cache.as_ref().unwrap().1)
     }
 
     /// The sector IDs of the mini stream's chain, in order.
     fn mini_stream_sectors(&mut self) -> io::Result<&[u32]> {
         let start_sector = self.directory.root_dir_entry().start_sector;
+        let version = self.chain_cache_version;
         Self::cached_chain_sectors(
             &mut self.directory,
             &mut self.mini_stream_sectors,
+            version,
             start_sector,
         )
     }
@@ -206,9 +240,11 @@ impl<F: Seek> MiniAllocator<F> {
     /// The sector IDs of the MiniFAT's chain, in order.
     fn minifat_sectors(&mut self) -> io::Result<&[u32]> {
         let start_sector = self.minifat_start_sector;
+        let version = self.chain_cache_version;
         Self::cached_chain_sectors(
             &mut self.directory,
             &mut self.minifat_sectors,
+            version,
             start_sector,
         )
     }
@@ -247,12 +283,10 @@ impl<F: Seek> MiniAllocator<F> {
 impl<F: Write + Seek> MiniAllocator<F> {
     /// Given the start sector of a chain, deallocates the entire chain.
     pub fn free_chain(&mut self, start_sector_id: u32) -> io::Result<()> {
-        if start_sector_id == self.directory.root_dir_entry().start_sector {
-            self.mini_stream_sectors = None;
-        }
-        if start_sector_id == self.minifat_start_sector {
-            self.minifat_sectors = None;
-        }
+        // Bumping the version invalidates both chain caches, whichever
+        // chain was freed.
+        self.chain_cache_version =
+            self.chain_cache_version.wrapping_add(1);
         self.directory.free_chain(start_sector_id)
     }
 
@@ -364,7 +398,10 @@ impl<F: Write + Seek> MiniAllocator<F> {
             debug_assert!(self.minifat.is_empty());
             self.minifat_start_sector =
                 self.directory.begin_chain(SectorInit::Fat)?;
-            self.minifat_sectors = Some(vec![self.minifat_start_sector]);
+            self.minifat_sectors =
+                Some((self.chain_cache_version, vec![
+                    self.minifat_start_sector
+                ]));
             let mut header = self.directory.seek_within_header(60)?;
             header.write_le_u32(self.minifat_start_sector)?;
             header.write_le_u32(1)?;
@@ -375,8 +412,8 @@ impl<F: Write + Seek> MiniAllocator<F> {
             let new_sector =
                 self.directory.extend_chain(last_sector, SectorInit::Fat)?;
             let sectors = self.minifat_sectors.as_mut().unwrap();
-            sectors.push(new_sector);
-            let num_minifat_sectors = sectors.len() as u32;
+            sectors.1.push(new_sector);
+            let num_minifat_sectors = sectors.1.len() as u32;
             let mut header = self.directory.seek_within_header(64)?;
             header.write_le_u32(num_minifat_sectors)?;
         }
@@ -402,7 +439,8 @@ impl<F: Write + Seek> MiniAllocator<F> {
         {
             debug_assert_eq!(mini_stream_len, 0);
             let start_sector = self.directory.begin_chain(SectorInit::Zero)?;
-            self.mini_stream_sectors = Some(vec![start_sector]);
+            self.mini_stream_sectors =
+                Some((self.chain_cache_version, vec![start_sector]));
             start_sector
         } else {
             mini_stream_start_sector
@@ -417,7 +455,7 @@ impl<F: Write + Seek> MiniAllocator<F> {
             let last_sector = *self.mini_stream_sectors()?.last().unwrap();
             let new_sector =
                 self.directory.extend_chain(last_sector, SectorInit::Zero)?;
-            self.mini_stream_sectors.as_mut().unwrap().push(new_sector);
+            self.mini_stream_sectors.as_mut().unwrap().1.push(new_sector);
         }
 
         // Update length of mini stream in root directory entry.

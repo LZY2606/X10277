@@ -135,6 +135,24 @@ impl<F> Directory<F> {
         self.allocator.inner()
     }
 
+    /// The sector allocator that this directory wraps.  Used by the
+    /// structural summary.
+    pub(crate) fn allocator(&self) -> &Allocator<F> {
+        &self.allocator
+    }
+
+    /// All directory entries, in stream-ID order (including unallocated
+    /// ones).  Used by the structural summary.
+    pub(crate) fn dir_entries(&self) -> &[DirEntry] {
+        &self.dir_entries
+    }
+
+    /// The sector IDs of the directory chain, in chain order.  Used by the
+    /// structural summary.
+    pub(crate) fn dir_sector_ids(&self) -> &[u32] {
+        &self.dir_sector_ids
+    }
+
     pub fn sector_len(&self) -> usize {
         self.allocator.sector_len()
     }
