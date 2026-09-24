@@ -16,6 +16,7 @@ pub mod path;
 mod sector;
 mod stream;
 mod stream_buffer;
+pub mod summary;
 mod timestamp;
 mod validate;
 mod version;

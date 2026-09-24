@@ -85,6 +85,25 @@ impl<F> Allocator<F> {
         Ok(next_id)
     }
 
+    /// The FAT entries, as currently held in memory (and mirrored to the
+    /// underlying file).  This is the same state the allocation and chain
+    /// code above operates on; it is exposed read-only so that diagnostics
+    /// such as `CompoundFile::structural_summary` observe exactly what the
+    /// production read path sees.
+    pub fn fat(&self) -> &[u32] {
+        &self.fat
+    }
+
+    /// The DIFAT entries (sector IDs of the FAT sectors), in order.
+    pub fn difat(&self) -> &[u32] {
+        &self.difat
+    }
+
+    /// The sector IDs of the DIFAT chain itself, in order.
+    pub fn difat_sector_ids(&self) -> &[u32] {
+        &self.difat_sector_ids
+    }
+
     pub fn into_inner(self) -> F {
         self.sectors.into_inner()
     }

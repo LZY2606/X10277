@@ -121,6 +121,24 @@ impl<F> MiniAllocator<F> {
         self.directory.dir_entry(stream_id)
     }
 
+    /// The directory manager beneath this allocator, exposed read-only so
+    /// that diagnostics can observe the same state the production path
+    /// uses.
+    pub fn directory(&self) -> &Directory<F> {
+        &self.directory
+    }
+
+    /// The MiniFAT entries, as currently held in memory (and mirrored to
+    /// the underlying file).
+    pub fn minifat(&self) -> &[u32] {
+        &self.minifat
+    }
+
+    /// The sector ID where the MiniFAT chain starts.
+    pub fn minifat_start_sector(&self) -> u32 {
+        self.minifat_start_sector
+    }
+
     fn validate(&mut self, validation: Validation) -> io::Result<()> {
         let root_entry = self.directory.root_dir_entry();
         let root_stream_mini_sectors =

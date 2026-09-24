@@ -152,6 +152,22 @@ impl<F> Directory<F> {
         Some(stream_id)
     }
 
+    /// The sector allocator beneath this directory, exposed read-only so
+    /// that diagnostics can observe the same state the production path uses.
+    pub fn allocator(&self) -> &Allocator<F> {
+        &self.allocator
+    }
+
+    /// The sector IDs of the directory chain, in order.
+    pub fn dir_sector_ids(&self) -> &[u32] {
+        &self.dir_sector_ids
+    }
+
+    /// All directory entry slots, including unallocated ones.
+    pub fn dir_entries(&self) -> &[DirEntry] {
+        &self.dir_entries
+    }
+
     pub fn open_chain(
         &mut self,
         start_sector_id: u32,

@@ -383,6 +383,41 @@ impl<F> CompoundFile<F> {
             Err(_) => unreachable!(),
         }
     }
+
+    /// Returns a deterministic, human-readable summary of this compound
+    /// file's internal structure: its allocation chains (directory chain,
+    /// MiniFAT chain, mini stream chain, and every stream's FAT or MiniFAT
+    /// chain) and its directory tree (parent/child/sibling relations,
+    /// CLSIDs, state bits, timestamps, and stream lengths).
+    ///
+    /// Sector IDs and stream IDs are internal numbering, so they are
+    /// relabeled in order of first appearance: two files with the same
+    /// logical contents summarize identically even if their internal
+    /// numbering legitimately differs.  This is a diagnostic aid for
+    /// regression gates (see `tests/deterministic_fixture.rs`); it reads
+    /// the same in-memory state as the production read path, via the same
+    /// preorder traversal as `walk()`, and mutates nothing.
+    #[doc(hidden)]
+    pub fn structural_summary(&self) -> String {
+        let paths: Vec<PathBuf> =
+            self.walk().map(|entry| entry.path().to_path_buf()).collect();
+        let minialloc = self.minialloc();
+        let stream_ids: Vec<u32> = paths
+            .iter()
+            .map(|path| {
+                let names = internal::path::name_chain_from_path(path)
+                    .expect("walk produced an invalid path");
+                minialloc
+                    .stream_id_for_name_chain(&names)
+                    .expect("walk produced an unknown path")
+            })
+            .collect();
+        internal::summary::structural_summary(
+            &minialloc,
+            &paths,
+            &stream_ids,
+        )
+    }
 }
 
 impl<F: Seek> CompoundFile<F> {
